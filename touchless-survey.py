@@ -32,7 +32,7 @@ st.set_page_config(
 
 # TEACHABLE MACHINE MODEL URL (Get this from "Export Model" → Copy Link)
 # Example: https://teachablemachine.withgoogle.com/models/YOUR_MODEL_ID/
-MODEL_URL = "https://teachablemachine.withgoogle.com/models/YOUR_MODEL_ID/"
+MODEL_URL = "https://teachablemachine.withgoogle.com/models/w3jVYBYFB/"
 
 # Survey questions (customize these)
 SURVEY_QUESTIONS = [
