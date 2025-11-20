@@ -1,18 +1,19 @@
 # ============================================================================
 # TOUCHLESS SATISFACTION SURVEY SYSTEM
-# Hand Gesture Recognition using Teachable Machine + Streamlit
+# Using Teachable Machine Shareable Link (No Download Needed!)
 # ============================================================================
 
 import streamlit as st
 import tensorflow as tf
 import numpy as np
 from PIL import Image
-import cv2
 import pandas as pd
 from datetime import datetime
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
+import requests
 import json
+from io import BytesIO
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -28,6 +29,10 @@ st.set_page_config(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+
+# TEACHABLE MACHINE MODEL URL (Get this from "Export Model" → Copy Link)
+# Example: https://teachablemachine.withgoogle.com/models/YOUR_MODEL_ID/
+MODEL_URL = "https://teachablemachine.withgoogle.com/models/YOUR_MODEL_ID/"
 
 # Survey questions (customize these)
 SURVEY_QUESTIONS = [
@@ -47,54 +52,106 @@ GESTURE_MAP = {
     'closed_fist': {'label': 'No Answer', 'score': None, 'emoji': '✊'}
 }
 
-# Model path (update with your path)
-MODEL_PATH = "model/model.savedmodel"  # Will be loaded from uploaded files
-
-# Google Sheets configuration
+# Google Sheets name
 SHEET_NAME = "Survey_Responses"
-GOOGLE_CREDENTIALS = st.secrets.get("google_credentials", None)
 
 # ============================================================================
-# LOAD MODEL
+# LOAD MODEL FROM TEACHABLE MACHINE LINK
 # ============================================================================
 
 @st.cache_resource
-def load_model():
-    """Load Teachable Machine model"""
+def load_model_from_url(model_url):
+    """Load Teachable Machine model from shareable link"""
     try:
-        model = tf.saved_model.load(MODEL_PATH)
-        return model
+        # Ensure URL ends with /
+        if not model_url.endswith('/'):
+            model_url += '/'
+        
+        # Load model.json to get class names
+        metadata_url = model_url + 'metadata.json'
+        response = requests.get(metadata_url)
+        metadata = response.json()
+        
+        # Extract class names
+        class_names = [label['className'] for label in metadata['labels']]
+        
+        # Load the model
+        model_json_url = model_url + 'model.json'
+        model = tf.keras.models.model_from_json(
+            requests.get(model_json_url).text
+        )
+        
+        # Load weights
+        weights_url = model_url + 'weights.bin'
+        weights_response = requests.get(weights_url)
+        weights_buffer = BytesIO(weights_response.content)
+        model.load_weights(weights_buffer)
+        
+        return model, class_names
+    
     except Exception as e:
-        st.error(f"Error loading model: {e}")
-        st.info("Please upload your Teachable Machine model to the 'model' folder")
-        return None
+        st.error(f"Error loading model from URL: {e}")
+        st.info("Please check your Teachable Machine model URL")
+        return None, None
 
 # ============================================================================
-# GOOGLE SHEETS CONNECTION
+# GOOGLE SHEETS CONNECTION (FIXED)
 # ============================================================================
 
 def connect_to_sheets():
-    """Connect to Google Sheets"""
+    """Connect to Google Sheets using Streamlit secrets"""
     try:
-        scope = ['https://spreadsheets.google.com/feeds',
-                'https://www.googleapis.com/auth/drive']
+        # Define scope
+        scope = [
+            'https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/drive'
+        ]
         
         # Load credentials from Streamlit secrets
-        creds_dict = json.loads(st.secrets["google_credentials"])
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        client = gspread.authorize(creds)
+        credentials_dict = dict(st.secrets["google_credentials"])
+        credentials = Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=scope
+        )
         
-        # Open the sheet
-        sheet = client.open(SHEET_NAME).sheet1
+        # Authorize client
+        client = gspread.authorize(credentials)
+        
+        # Try to open existing sheet, create if doesn't exist
+        try:
+            sheet = client.open(SHEET_NAME).sheet1
+            st.success(f"Connected to existing sheet: {SHEET_NAME}")
+        except gspread.exceptions.SpreadsheetNotFound:
+            # Create new spreadsheet
+            spreadsheet = client.create(SHEET_NAME)
+            sheet = spreadsheet.sheet1
+            
+            # Add headers
+            headers = [
+                'Timestamp', 'Respondent_Name', 'Organization',
+                'Q1_Label', 'Q1_Score', 'Q1_Confidence',
+                'Q2_Label', 'Q2_Score', 'Q2_Confidence',
+                'Q3_Label', 'Q3_Score', 'Q3_Confidence',
+                'Q4_Label', 'Q4_Score', 'Q4_Confidence',
+                'Q5_Label', 'Q5_Score', 'Q5_Confidence'
+            ]
+            sheet.append_row(headers)
+            
+            # Share with everyone (optional - or share manually)
+            spreadsheet.share('', perm_type='anyone', role='writer')
+            
+            st.success(f"Created new sheet: {SHEET_NAME}")
+        
         return sheet
+    
     except Exception as e:
         st.error(f"Error connecting to Google Sheets: {e}")
+        st.info("💡 Make sure you've added Google credentials to Streamlit secrets")
         return None
 
 def save_to_sheets(sheet, data):
     """Save survey response to Google Sheets"""
     try:
-        # Append row to sheet
         sheet.append_row(data)
         return True
     except Exception as e:
@@ -118,26 +175,20 @@ def preprocess_image(image):
     
     return img_array
 
-def predict_gesture(model, image):
+def predict_gesture(model, class_names, image):
     """Predict hand gesture from image"""
     try:
         # Preprocess
         img_array = preprocess_image(image)
         
         # Predict
-        prediction = model(tf.constant(img_array))
-        
-        # Get probabilities
-        result_key = list(prediction.keys())[0]
-        probabilities = prediction[result_key].numpy()[0]
+        predictions = model.predict(img_array, verbose=0)
+        probabilities = predictions[0]
         
         # Get predicted class
         predicted_idx = np.argmax(probabilities)
         confidence = probabilities[predicted_idx]
-        
-        # Map to gesture name
-        gesture_names = list(GESTURE_MAP.keys())
-        predicted_gesture = gesture_names[predicted_idx]
+        predicted_gesture = class_names[predicted_idx]
         
         return predicted_gesture, confidence, probabilities
     
@@ -153,7 +204,7 @@ def main():
     st.title("✋ Touchless Satisfaction Survey")
     st.markdown("### Use hand gestures to answer survey questions!")
     
-    # Sidebar - Instructions
+    # Sidebar - Instructions & Configuration
     with st.sidebar:
         st.header("📋 Instructions")
         st.markdown("""
@@ -173,13 +224,22 @@ def main():
         
         **Steps:**
         1. Read the question
-        2. Click "Activate Camera"
+        2. Click "Take photo"
         3. Show your hand gesture
         4. Capture response
-        5. Move to next question
+        5. Confirm and move to next question
         """)
         
         st.markdown("---")
+        
+        # Model URL input (for easy switching)
+        st.subheader("⚙️ Configuration")
+        model_url_input = st.text_input(
+            "Teachable Machine Model URL:",
+            value=MODEL_URL,
+            help="Get this from Teachable Machine → Export → Copy Link"
+        )
+        
         st.info("💡 Make sure your hand is clearly visible!")
     
     # Initialize session state
@@ -189,13 +249,22 @@ def main():
         st.session_state.survey_started = False
         st.session_state.survey_completed = False
         st.session_state.respondent_name = ""
+        st.session_state.model_url = model_url_input
+    
+    # Update model URL if changed
+    if model_url_input != st.session_state.model_url:
+        st.session_state.model_url = model_url_input
+        st.cache_resource.clear()
     
     # Load model
-    model = load_model()
+    with st.spinner("Loading AI model..."):
+        model, class_names = load_model_from_url(st.session_state.model_url)
     
-    if model is None:
-        st.warning("⚠️ Model not loaded. Please check model path.")
-        return
+    if model is None or class_names is None:
+        st.error("❌ Failed to load model. Please check the URL and try again.")
+        st.stop()
+    
+    st.success("✅ Model loaded successfully!")
     
     # Survey start screen
     if not st.session_state.survey_started:
@@ -282,14 +351,23 @@ def main():
             
             # Predict gesture
             with st.spinner("Analyzing gesture..."):
-                gesture, confidence, probs = predict_gesture(model, image)
+                gesture, confidence, probs = predict_gesture(model, class_names, image)
             
             if gesture:
-                gesture_info = GESTURE_MAP[gesture]
+                gesture_info = GESTURE_MAP.get(gesture, {
+                    'label': gesture,
+                    'score': 3,
+                    'emoji': '🤷'
+                })
                 
                 # Display result
                 st.success(f"Detected: {gesture_info['emoji']} {gesture_info['label']}")
                 st.info(f"Confidence: {confidence:.1%}")
+                
+                # Show all predictions
+                with st.expander("View all predictions"):
+                    for i, (class_name, prob) in enumerate(zip(class_names, probs)):
+                        st.write(f"{class_name}: {prob:.1%}")
                 
                 # Confirm button
                 if st.button("✅ Confirm This Response", type="primary", use_container_width=True):
@@ -314,23 +392,27 @@ def main():
                         st.session_state.survey_completed = True
                         
                         # Prepare data for sheets
-                        sheet = connect_to_sheets()
-                        if sheet:
-                            row_data = [
-                                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                st.session_state.respondent_name,
-                                st.session_state.organization
-                            ]
-                            
-                            # Add all responses
-                            for resp in st.session_state.responses:
-                                row_data.extend([
-                                    resp['label'],
-                                    resp['score'] if resp['score'] else 'N/A',
-                                    f"{resp['confidence']:.2%}"
-                                ])
-                            
-                            save_to_sheets(sheet, row_data)
+                        with st.spinner("Saving to Google Sheets..."):
+                            sheet = connect_to_sheets()
+                            if sheet:
+                                row_data = [
+                                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                    st.session_state.respondent_name,
+                                    st.session_state.organization
+                                ]
+                                
+                                # Add all responses
+                                for resp in st.session_state.responses:
+                                    row_data.extend([
+                                        resp['label'],
+                                        resp['score'] if resp['score'] else 'N/A',
+                                        f"{resp['confidence']:.2%}"
+                                    ])
+                                
+                                if save_to_sheets(sheet, row_data):
+                                    st.success("✅ Saved to Google Sheets!")
+                                else:
+                                    st.warning("⚠️ Could not save to Google Sheets")
                         
                         st.rerun()
     
