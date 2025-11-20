@@ -1,0 +1,380 @@
+# ============================================================================
+# TOUCHLESS SATISFACTION SURVEY SYSTEM
+# Hand Gesture Recognition using Teachable Machine + Streamlit
+# ============================================================================
+
+import streamlit as st
+import tensorflow as tf
+import numpy as np
+from PIL import Image
+import cv2
+import pandas as pd
+from datetime import datetime
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import json
+
+# ============================================================================
+# PAGE CONFIGURATION
+# ============================================================================
+
+st.set_page_config(
+    page_title="Touchless Satisfaction Survey",
+    page_icon="✋",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Survey questions (customize these)
+SURVEY_QUESTIONS = [
+    "How satisfied are you with the workshop content?",
+    "How satisfied are you with the instructor's teaching?",
+    "How satisfied are you with the workshop materials?",
+    "How satisfied are you with the hands-on activities?",
+    "How satisfied are you with the overall workshop experience?"
+]
+
+# Gesture to response mapping
+GESTURE_MAP = {
+    'thumbs_up': {'label': 'Satisfied', 'score': 4, 'emoji': '👍'},
+    'heart_sign': {'label': 'Very Satisfied', 'score': 5, 'emoji': '❤️'},
+    'thumbs_down': {'label': 'Unsatisfied', 'score': 2, 'emoji': '👎'},
+    'waving_finger': {'label': 'Very Unsatisfied', 'score': 1, 'emoji': '☝️'},
+    'closed_fist': {'label': 'No Answer', 'score': None, 'emoji': '✊'}
+}
+
+# Model path (update with your path)
+MODEL_PATH = "model/model.savedmodel"  # Will be loaded from uploaded files
+
+# Google Sheets configuration
+SHEET_NAME = "Survey_Responses"
+GOOGLE_CREDENTIALS = st.secrets.get("google_credentials", None)
+
+# ============================================================================
+# LOAD MODEL
+# ============================================================================
+
+@st.cache_resource
+def load_model():
+    """Load Teachable Machine model"""
+    try:
+        model = tf.saved_model.load(MODEL_PATH)
+        return model
+    except Exception as e:
+        st.error(f"Error loading model: {e}")
+        st.info("Please upload your Teachable Machine model to the 'model' folder")
+        return None
+
+# ============================================================================
+# GOOGLE SHEETS CONNECTION
+# ============================================================================
+
+def connect_to_sheets():
+    """Connect to Google Sheets"""
+    try:
+        scope = ['https://spreadsheets.google.com/feeds',
+                'https://www.googleapis.com/auth/drive']
+        
+        # Load credentials from Streamlit secrets
+        creds_dict = json.loads(st.secrets["google_credentials"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        
+        # Open the sheet
+        sheet = client.open(SHEET_NAME).sheet1
+        return sheet
+    except Exception as e:
+        st.error(f"Error connecting to Google Sheets: {e}")
+        return None
+
+def save_to_sheets(sheet, data):
+    """Save survey response to Google Sheets"""
+    try:
+        # Append row to sheet
+        sheet.append_row(data)
+        return True
+    except Exception as e:
+        st.error(f"Error saving to sheets: {e}")
+        return False
+
+# ============================================================================
+# IMAGE PROCESSING
+# ============================================================================
+
+def preprocess_image(image):
+    """Preprocess image for model prediction"""
+    # Resize to 224x224 (Teachable Machine standard)
+    img = image.resize((224, 224))
+    
+    # Convert to array and normalize
+    img_array = np.array(img).astype(np.float32) / 255.0
+    
+    # Add batch dimension
+    img_array = np.expand_dims(img_array, axis=0)
+    
+    return img_array
+
+def predict_gesture(model, image):
+    """Predict hand gesture from image"""
+    try:
+        # Preprocess
+        img_array = preprocess_image(image)
+        
+        # Predict
+        prediction = model(tf.constant(img_array))
+        
+        # Get probabilities
+        result_key = list(prediction.keys())[0]
+        probabilities = prediction[result_key].numpy()[0]
+        
+        # Get predicted class
+        predicted_idx = np.argmax(probabilities)
+        confidence = probabilities[predicted_idx]
+        
+        # Map to gesture name
+        gesture_names = list(GESTURE_MAP.keys())
+        predicted_gesture = gesture_names[predicted_idx]
+        
+        return predicted_gesture, confidence, probabilities
+    
+    except Exception as e:
+        st.error(f"Prediction error: {e}")
+        return None, 0, []
+
+# ============================================================================
+# MAIN APP
+# ============================================================================
+
+def main():
+    st.title("✋ Touchless Satisfaction Survey")
+    st.markdown("### Use hand gestures to answer survey questions!")
+    
+    # Sidebar - Instructions
+    with st.sidebar:
+        st.header("📋 Instructions")
+        st.markdown("""
+        **How to respond:**
+        
+        ❤️ **Heart Sign** = Very Satisfied (5)
+        
+        👍 **Thumbs Up** = Satisfied (4)
+        
+        👎 **Thumbs Down** = Unsatisfied (2)
+        
+        ☝️ **Waving Finger** = Very Unsatisfied (1)
+        
+        ✊ **Closed Fist** = No Answer
+        
+        ---
+        
+        **Steps:**
+        1. Read the question
+        2. Click "Activate Camera"
+        3. Show your hand gesture
+        4. Capture response
+        5. Move to next question
+        """)
+        
+        st.markdown("---")
+        st.info("💡 Make sure your hand is clearly visible!")
+    
+    # Initialize session state
+    if 'current_question' not in st.session_state:
+        st.session_state.current_question = 0
+        st.session_state.responses = []
+        st.session_state.survey_started = False
+        st.session_state.survey_completed = False
+        st.session_state.respondent_name = ""
+    
+    # Load model
+    model = load_model()
+    
+    if model is None:
+        st.warning("⚠️ Model not loaded. Please check model path.")
+        return
+    
+    # Survey start screen
+    if not st.session_state.survey_started:
+        st.markdown("## Welcome to the Survey!")
+        st.markdown("Please enter your information to begin:")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            name = st.text_input("Your Name (Optional):", key="name_input")
+        
+        with col2:
+            organization = st.text_input("Organization/Institution:", key="org_input")
+        
+        if st.button("🚀 Start Survey", type="primary", use_container_width=True):
+            st.session_state.respondent_name = name if name else "Anonymous"
+            st.session_state.organization = organization if organization else "N/A"
+            st.session_state.survey_started = True
+            st.session_state.start_time = datetime.now()
+            st.rerun()
+        
+        return
+    
+    # Survey completed screen
+    if st.session_state.survey_completed:
+        st.success("✅ Survey Completed! Thank you for your feedback!")
+        
+        # Display summary
+        st.markdown("## Your Responses Summary")
+        
+        summary_data = []
+        for i, response in enumerate(st.session_state.responses):
+            summary_data.append({
+                'Question': f"Q{i+1}",
+                'Response': response['label'],
+                'Score': response['score'] if response['score'] else 'N/A',
+                'Confidence': f"{response['confidence']:.1%}"
+            })
+        
+        df_summary = pd.DataFrame(summary_data)
+        st.dataframe(df_summary, use_container_width=True)
+        
+        # Calculate average score
+        scores = [r['score'] for r in st.session_state.responses if r['score'] is not None]
+        if scores:
+            avg_score = sum(scores) / len(scores)
+            st.metric("Average Satisfaction Score", f"{avg_score:.2f} / 5.0")
+        
+        if st.button("📝 Submit Another Response"):
+            # Reset session
+            st.session_state.current_question = 0
+            st.session_state.responses = []
+            st.session_state.survey_started = False
+            st.session_state.survey_completed = False
+            st.rerun()
+        
+        return
+    
+    # Survey in progress
+    current_q = st.session_state.current_question
+    total_q = len(SURVEY_QUESTIONS)
+    
+    # Progress bar
+    progress = (current_q / total_q)
+    st.progress(progress, text=f"Question {current_q + 1} of {total_q}")
+    
+    # Display current question
+    st.markdown(f"## Question {current_q + 1}")
+    st.markdown(f"### {SURVEY_QUESTIONS[current_q]}")
+    
+    # Camera input
+    st.markdown("---")
+    st.markdown("**Show your hand gesture and capture:**")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        # Camera input
+        img_file = st.camera_input("Camera", key=f"camera_{current_q}")
+        
+        if img_file is not None:
+            # Load image
+            image = Image.open(img_file)
+            
+            # Predict gesture
+            with st.spinner("Analyzing gesture..."):
+                gesture, confidence, probs = predict_gesture(model, image)
+            
+            if gesture:
+                gesture_info = GESTURE_MAP[gesture]
+                
+                # Display result
+                st.success(f"Detected: {gesture_info['emoji']} {gesture_info['label']}")
+                st.info(f"Confidence: {confidence:.1%}")
+                
+                # Confirm button
+                if st.button("✅ Confirm This Response", type="primary", use_container_width=True):
+                    # Save response
+                    response_data = {
+                        'question': SURVEY_QUESTIONS[current_q],
+                        'gesture': gesture,
+                        'label': gesture_info['label'],
+                        'score': gesture_info['score'],
+                        'confidence': confidence,
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    
+                    st.session_state.responses.append(response_data)
+                    
+                    # Move to next question or complete
+                    if current_q < total_q - 1:
+                        st.session_state.current_question += 1
+                        st.rerun()
+                    else:
+                        # Survey completed - save to Google Sheets
+                        st.session_state.survey_completed = True
+                        
+                        # Prepare data for sheets
+                        sheet = connect_to_sheets()
+                        if sheet:
+                            row_data = [
+                                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                st.session_state.respondent_name,
+                                st.session_state.organization
+                            ]
+                            
+                            # Add all responses
+                            for resp in st.session_state.responses:
+                                row_data.extend([
+                                    resp['label'],
+                                    resp['score'] if resp['score'] else 'N/A',
+                                    f"{resp['confidence']:.2%}"
+                                ])
+                            
+                            save_to_sheets(sheet, row_data)
+                        
+                        st.rerun()
+    
+    with col2:
+        st.markdown("**Gesture Guide:**")
+        for gesture, info in GESTURE_MAP.items():
+            st.markdown(f"{info['emoji']} {info['label']}")
+    
+    # Navigation buttons
+    st.markdown("---")
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        if current_q > 0:
+            if st.button("⬅️ Previous Question"):
+                st.session_state.current_question -= 1
+                st.rerun()
+    
+    with col2:
+        if st.button("🔄 Reset Survey", type="secondary"):
+            st.session_state.current_question = 0
+            st.session_state.responses = []
+            st.session_state.survey_started = False
+            st.rerun()
+    
+    with col3:
+        if current_q < total_q - 1:
+            if st.button("Skip Question ➡️"):
+                # Save as no answer
+                response_data = {
+                    'question': SURVEY_QUESTIONS[current_q],
+                    'gesture': 'closed_fist',
+                    'label': 'No Answer',
+                    'score': None,
+                    'confidence': 1.0,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                st.session_state.responses.append(response_data)
+                st.session_state.current_question += 1
+                st.rerun()
+
+# ============================================================================
+# RUN APP
+# ============================================================================
+
+if __name__ == "__main__":
+    main()
